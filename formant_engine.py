@@ -53,11 +53,11 @@ VOWELS: dict[str, tuple[float, float]] = {
 }
 
 VOWEL_F3: dict[str, float] = {
-    "OO": 2400,
-    "OH": 2600,
-    "AH": 2800,
-    "AE": 3000,
-    "EE": 3200,
+    "OO": 2500,   # "boot"   — high, rounded
+    "OH": 2600,   # "go"     — slightly higher
+    "AH": 2550,   # "father" — dips, does NOT climb linearly
+    "AE": 2900,   # "cat"    — rises toward front vowels
+    "EE": 3100,   # "feet"   — highest F3
 }
 
 # Default sweep trajectory (Y=0 → OO, Y=1 → EE)
@@ -349,22 +349,30 @@ class PedalParams:
     wah_f_max:  float = 2500.0
     wah_Q:      float = 4.0
 
-    # Pre-drive: tanh soft clipper applied BEFORE filters.
-    # 1.0 = clean (no effect), 2.0 = mild warmth, 4.0+ = obvious drive.
-    # This is the most important knob for making formants audible on guitar.
-    pre_drive:  float = 1.0
-    fuzz_mode:  str = "tanh"
-    pre_emphasis_db: float = 0.0
+    # Pre-drive: fuzz applied BEFORE filters.
+    # 1.0 = clean, 4.0 = medium, 8.0+ = heavy.
+    # Higher drive creates richer harmonics — essential for audible formants.
+    pre_drive:  float = 4.0
+    fuzz_mode:  str = "diode"
+    # High-shelf boost above 1 kHz before the formant filters.
+    # Compensates for guitar's natural spectral roll-off so F2/F3 have
+    # energy to shape. 8 dB is a good starting point.
+    pre_emphasis_db: float = 8.0
 
-    # Formant filters — pure bandpass, Q controls bandwidth
-    # Higher Q = narrower, more nasal/robotic. 8-14 is musical, 16-22 is obvious.
-    f1_Q:       float = 12.0
-    f2_Q:       float = 14.0
-    f3_Q:       float = 10.0
-    f3_gain:    float = 0.45
-    # Relative gain of the reconstructed formant signal before the wet/dry blend.
-    # Raise this if the formant effect feels too quiet at high formant_wet values.
-    formant_gain: float = 1.5
+    # Formant filter Q — controls bandwidth of each resonant peak.
+    # Lower Q = wider = more natural. Real speech F1 BW is ~100-200 Hz.
+    #   F1: Q=4  → BW=75 Hz at 300 Hz, 200 Hz at 800 Hz  (natural)
+    #   F2: Q=10 → BW=230 Hz at 2300 Hz, 90 Hz at 900 Hz (good at high F2)
+    #   F3: Q=8  → BW=390 Hz at 3100 Hz                   (broad, subtle)
+    f1_Q:       float = 4.0
+    f2_Q:       float = 10.0
+    f3_Q:       float = 8.0
+    f3_gain:    float = 0.45   # weight of F3 in the summed vocal tract
+    # Peak boost at each formant (dB). F2 gets -3dB, F3 gets -6dB relative.
+    # 18 dB gives a clear vowel colour without sounding like a synth filter.
+    formant_peak_db: float = 18.0
+    # Overall gain of the vocal tract signal before wet/dry blend.
+    formant_gain: float = 1.0
 
     # Envelope follower → F2 modulation
     env_attack_ms:   float = 5.0
@@ -474,9 +482,12 @@ class PedalEngine:
 
         self.pre_emphasis.set_high_shelf(1000.0, p.pre_emphasis_db, fs)
         self.wah_bpf.set_bandpass(wah_f, p.wah_Q, fs)
-        self.f1_bpf.set_bandpass(f1_f, p.f1_Q, fs)
-        self.f2_bpf.set_bandpass(f2_f, p.f2_Q, fs)
-        self.f3_bpf.set_bandpass(f3_f, p.f3_Q, fs)
+        # Peaking EQ for formants: preserves full-bandwidth signal, adds
+        # resonant peaks at the vowel formant frequencies.  This is closer
+        # to how a real vocal tract works than pure bandpass filtering.
+        self.f1_bpf.set_peaking(f1_f, p.f1_Q, p.formant_peak_db,        fs)
+        self.f2_bpf.set_peaking(f2_f, p.f2_Q, p.formant_peak_db - 3.0,  fs)
+        self.f3_bpf.set_peaking(f3_f, p.f3_Q, p.formant_peak_db - 6.0,  fs)
 
         # Store current smoothed values for the GUI to read
         self._current_wah_f = wah_f
@@ -495,27 +506,27 @@ class PedalEngine:
         Returns: float32 array, same shape.
 
         Signal path:
-          input → pre_gain → pre_drive (tanh)
-                               ├→ wah BPF  ─────────────────────────────┐
-                               └→ F1 BPF + F2 BPF (summed = vocal tract)│
-                                                                          ↓
-                                          dry blend ← formant_wet →  output_gain
+          x_clean (pre-drive) ──────────────────────────────────────────┐
+          x_clean → fuzz → pre_emphasis → wah BPF (wet/dry)             │
+                                            └→ F1 peak + F2 peak + F3 peak (parallel)
+                                               weighted sum = vocal_tract │
+                                                                           ↓
+                                    formant_wet blend ← x_clean ─────────┘
+                                      → output_gain (tanh safety clip)
 
-        Key fix vs v1: the formant filters are PURE BANDPASS at full wet.
-        We do NOT mix the dry signal back inside the formant chain.
-        A vocal tract passes only the formant bands — the dry signal is a
-        separate parallel blend. At formant_wet=1.0, you hear only F1+F2.
-        At formant_wet=0.0, you hear only dry (bypassed).
+        Formant filters are PEAKING EQ (not pure BPF): the full-bandwidth
+        signal is preserved with resonant boosts at the vowel frequencies.
+        Dry blend uses x_clean (pre-drive) so wet=0 gives unprocessed guitar.
         """
         p = self.params
-        x = x.astype(np.float64) * p.pre_gain
+        x_clean = x.astype(np.float64) * p.pre_gain   # save pre-drive for dry blend
 
-        # Pre-drive: tanh normalised for unity gain at small signals
+        # Pre-drive: harmonic enrichment — essential for audible formants
         if p.pre_drive > 1.001:
             fuzz_fn = FUZZ_MODEL_FUNCS.get(p.fuzz_mode, fuzz_tanh)
-            driven = fuzz_fn(x, p.pre_drive)
+            driven = fuzz_fn(x_clean, p.pre_drive)
         else:
-            driven = x
+            driven = x_clean
 
         # Envelope follower on post-drive signal.
         # Use TRANSIENT DELTA (fast - slow) so F2 is only offset on pick
@@ -525,6 +536,7 @@ class PedalEngine:
         slow_env = self.env_follower_slow.process_block(driven)
         transient = np.maximum(fast_env - slow_env, 0.0)
         f2_env_offset = float(np.mean(transient)) * p.env_f2_depth_hz
+        x = x_clean   # alias so remaining code reads cleanly
 
         # Update filter coefficients (smoothed, once per block)
         self._update_coefficients(f2_env_offset)
@@ -538,16 +550,19 @@ class PedalEngine:
         wah_out = self.wah_bpf.process_block(formant_input)
         wah_mix = (1 - p.wah_wet) * formant_input + p.wah_wet * wah_out
 
-        # Vocal tract: F1 and F2 pure bandpass filters in parallel, summed
-        # This IS the processed signal — no dry inside the formant chain
-        f1_out      = self.f1_bpf.process_block(wah_mix)
-        f2_out      = self.f2_bpf.process_block(wah_mix)
-        f3_out      = self.f3_bpf.process_block(wah_mix) * p.f3_gain
-        vocal_tract = (f1_out + f2_out + f3_out) / (2.0 + p.f3_gain)
+        # Vocal tract: three parallel peaking EQ filters (vowel resonances).
+        # Each filter boosts its band while passing everything else, so the
+        # output retains the full spectrum with vowel-coloured peaks on top.
+        f1_out = self.f1_bpf.process_block(wah_mix)
+        f2_out = self.f2_bpf.process_block(wah_mix)
+        f3_out = self.f3_bpf.process_block(wah_mix)
+        # F1 carries the most energy in natural vowels; F2 less; F3 subtle.
+        vocal_tract = f1_out * 0.55 + f2_out * 0.35 + f3_out * (p.f3_gain * 0.10)
         vocal_tract *= p.formant_gain
 
-        # Blend: formant_wet=1.0 → pure vocal tract, =0.0 → dry pass-through
-        output = (1.0 - p.formant_wet) * wah_mix + p.formant_wet * vocal_tract
+        # Blend: formant_wet=1.0 → full vowel filter, =0.0 → clean dry.
+        # Blend against x_clean (pre-drive) so at wet=0 you hear unprocessed guitar.
+        output = (1.0 - p.formant_wet) * x_clean + p.formant_wet * vocal_tract
 
         # Output gain + safety clip
         output = np.tanh(output * p.output_gain)

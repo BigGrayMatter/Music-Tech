@@ -31,12 +31,13 @@ current filter position animated in real time.
 """
 
 import argparse
+import os
 import queue
 import threading
 import time
 import numpy as np
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -102,6 +103,12 @@ class AudioThread(threading.Thread):
             mono = resample_poly(mono, self.FS // g, fs // g)
         self._file_data = mono.astype(np.float32)
         self._file_pos  = 0
+
+    def load_file_threadsafe(self, path):
+        """Load a new file from any thread. Resets playback to the start."""
+        with self._buf_lock:
+            self._load_file(path)
+            self._file_pos = 0
 
     def _get_file_block(self, n):
         if self._file_data is None:
@@ -184,6 +191,11 @@ class PlaytestGUI:
         self._build_vowel_plot()
         self._build_waveform_plot()
 
+        # Keyboard: Up/Down arrows sweep the vowel (Y) position in real time.
+        # Hold arrow key for continuous sweep. Step size 0.04 ≈ one vowel step.
+        self.root.bind("<Up>",   lambda e: self._nudge_y( 0.04))
+        self.root.bind("<Down>", lambda e: self._nudge_y(-0.04))
+
         # Periodic GUI update
         self.root.after(50, self._update_display)
 
@@ -221,26 +233,27 @@ class PlaytestGUI:
             ("X — wah",         "x_pos",         0.0,   1.0,   0.5,  1),
             ("Y — formant",     "y_pos",          0.0,   1.0,   0.5,  2),
             ("",                None,             0,     1,     0,    3),
-            ("Pre drive",       "pre_drive",      1.0,   8.0,   2.5,  4),
+            ("Pre drive",       "pre_drive",      1.0,   8.0,   4.0,  4),
             ("Pre gain",        "pre_gain",       0.1,   4.0,   1.0,  5),
-            ("Pre emphasis",    "pre_emphasis_db",-6.0,  12.0,   0.0,  6),
+            ("Pre emphasis dB", "pre_emphasis_db", 0.0,  16.0,   8.0,  6),
             ("Output gain",     "output_gain",    0.1,   2.0,   0.7,  7),
             ("",                None,             0,     1,     0,    8),
             ("Wah wet",         "wah_wet",        0.0,   1.0,   0.8,  9),
             ("Formant wet",     "formant_wet",    0.0,   1.0,   0.85, 10),
-            ("Formant gain",    "formant_gain",   0.1,   4.0,   1.5, 11),
-            ("F3 gain",         "f3_gain",         0.0,   2.0,   0.45, 12),
-            ("",                None,             0,     1,     0,   13),
-            ("Wah Q",           "wah_Q",          0.5,  20.0,   4.0, 14),
-            ("F1 Q",            "f1_Q",           1.0,  25.0,  12.0, 15),
-            ("F2 Q",            "f2_Q",           1.0,  25.0,  14.0, 16),
-            ("F3 Q",            "f3_Q",           1.0,  25.0,  10.0, 17),
-            ("",                None,             0,     1,     0,   18),
-            ("Env depth (Hz)",  "env_f2_depth_hz", 0,  500,  150.0, 19),
-            ("Env attack (ms)", "env_attack_ms",  1.0, 100.0,   5.0, 20),
-            ("Env release (ms)","env_release_ms", 5.0, 500.0,  80.0, 21),
-            ("",                None,             0,     1,     0,   22),
-            ("Model blend",     "model_blend",    0.0,   1.0,   1.0, 23),
+            ("Formant peak dB", "formant_peak_db", 6.0,  30.0,  18.0, 11),
+            ("Formant gain",    "formant_gain",   0.1,   4.0,   1.0,  12),
+            ("F3 gain",         "f3_gain",        0.0,   2.0,   0.45, 13),
+            ("",                None,             0,     1,     0,   14),
+            ("Wah Q",           "wah_Q",          0.5,  20.0,   4.0, 15),
+            ("F1 Q",            "f1_Q",           1.0,  15.0,   4.0, 16),
+            ("F2 Q",            "f2_Q",           1.0,  20.0,  10.0, 17),
+            ("F3 Q",            "f3_Q",           1.0,  20.0,   8.0, 18),
+            ("",                None,             0,     1,     0,   19),
+            ("Env depth (Hz)",  "env_f2_depth_hz", 0,  500,  150.0, 20),
+            ("Env attack (ms)", "env_attack_ms",  1.0, 100.0,   5.0, 21),
+            ("Env release (ms)","env_release_ms", 5.0, 500.0,  80.0, 22),
+            ("",                None,             0,     1,     0,   23),
+            ("Model blend",     "model_blend",    0.0,   1.0,   1.0, 24),
         ]
 
         for label, attr, lo, hi, default, row in slider_defs:
@@ -288,6 +301,24 @@ class PlaytestGUI:
             "<<ComboboxSelected>>",
             lambda _evt: setattr(self.engine.params, "fuzz_mode", self._fuzz_var.get()),
         )
+
+        # ── File playback controls ────────────────────────────────────
+        file_frame = ttk.Frame(left)
+        file_frame.grid(row=26, column=0, columnspan=3, sticky="ew",
+                        padx=4, pady=(8, 2))
+        ttk.Label(file_frame, text="Playback", style="Header.TLabel"
+                  ).pack(side="left", padx=(0, 8))
+        self._file_label_var = tk.StringVar(value="live input")
+        ttk.Label(file_frame, textvariable=self._file_label_var,
+                  foreground="#a6e3a1", background="#1e1e2e",
+                  font=("Helvetica", 9)
+                  ).pack(side="left", fill="x", expand=True)
+        ttk.Button(file_frame, text="Load WAV",
+                   command=self._open_file_dialog
+                   ).pack(side="right", padx=4)
+        ttk.Button(file_frame, text="Use mic/guitar",
+                   command=self._switch_to_live
+                   ).pack(side="right", padx=4)
 
         # ── Right top: waveform ───────────────────────────────────────
         self.wave_frame = ttk.Frame(right)
@@ -378,6 +409,38 @@ class PlaytestGUI:
     # ------------------------------------------------------------------
     # Periodic update
     # ------------------------------------------------------------------
+
+    def _nudge_y(self, delta):
+        new_y = float(np.clip(self.engine.params.y_pos + delta, 0.0, 1.0))
+        self.engine.params.y_pos = new_y
+        s, var, lbl = self._sliders["y_pos"]
+        var.set(new_y)
+        lbl.config(text=f"{new_y:.2f}")
+
+    def _open_file_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Select WAV file",
+            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if self.audio_thread is None:
+            self._file_label_var.set("(no audio thread)")
+            return
+        try:
+            self.audio_thread.load_file_threadsafe(path)
+            self._file_label_var.set(os.path.basename(path))
+            self.status_var.set(f"Loaded: {os.path.basename(path)}")
+        except Exception as exc:
+            self._file_label_var.set(f"Error: {exc}")
+
+    def _switch_to_live(self):
+        if self.audio_thread is not None:
+            with self.audio_thread._buf_lock:
+                self.audio_thread._file_data = None
+                self.audio_thread._file_pos  = 0
+        self._file_label_var.set("live input")
+        self.status_var.set("Switched to live mic/guitar input")
 
     def _update_display(self):
         state = self.engine.get_display_state()
