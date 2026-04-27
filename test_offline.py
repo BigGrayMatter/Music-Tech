@@ -19,19 +19,25 @@ Usage
 
 Requirements
 ------------
-  pip install soundfile numpy scipy matplotlib
+  pip install numpy
+  Optional for spectrogram reports: pip install scipy matplotlib
 """
 
 import argparse
 import os
+import wave
 import numpy as np
-import soundfile as sf
-import matplotlib
-matplotlib.use("Agg")          # headless — no display needed
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.patches import Ellipse
 from formant_engine import PedalEngine, PedalParams, interpolate_vowel, VOWELS, VOWEL_TRAJECTORY
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from scipy.signal import spectrogram as scipy_spectrogram
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    PLOTTING_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -70,21 +76,67 @@ PRESETS = {
 }
 
 
+def _decode_pcm(raw: bytes, sample_width: int) -> np.ndarray:
+    """Decode common PCM WAV sample widths to float32 in [-1, 1]."""
+    if sample_width == 1:
+        data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        return (data - 128.0) / 128.0
+    if sample_width == 2:
+        data = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+        return data / 32768.0
+    if sample_width == 3:
+        bytes_ = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        sign = np.where(bytes_[:, 2] & 0x80, 0xFF, 0x00).astype(np.uint8)
+        packed = np.column_stack([bytes_, sign])
+        data = packed.view("<i4").reshape(-1).astype(np.float32)
+        return data / 8388608.0
+    if sample_width == 4:
+        data = np.frombuffer(raw, dtype="<i4").astype(np.float32)
+        return data / 2147483648.0
+    raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes")
+
+
+def read_wav(path: str) -> tuple[np.ndarray, int]:
+    """Read a PCM WAV file with only the Python standard library."""
+    with wave.open(path, "rb") as wav:
+        fs = wav.getframerate()
+        n_channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        raw = wav.readframes(wav.getnframes())
+    data = _decode_pcm(raw, sample_width).reshape(-1, n_channels)
+    return data.mean(axis=1).astype(np.float32), fs
+
+
+def write_wav(path: str, audio: np.ndarray, fs: int):
+    """Write mono float audio as a 16-bit PCM WAV."""
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm = (audio * 32767.0).astype("<i2")
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(int(fs))
+        wav.writeframes(pcm.tobytes())
+
+
+def resample_linear(audio: np.ndarray, source_fs: int, target_fs: int) -> np.ndarray:
+    """Simple dependency-free resampler, good enough for offline playtests."""
+    if source_fs == target_fs:
+        return audio
+    duration = len(audio) / source_fs
+    old_t = np.linspace(0.0, duration, len(audio), endpoint=False)
+    new_len = int(round(duration * target_fs))
+    new_t = np.linspace(0.0, duration, new_len, endpoint=False)
+    return np.interp(new_t, old_t, audio).astype(np.float32)
+
+
 def load_audio(path: str, target_fs: float = 48000.0):
-    """Load audio file, convert to mono float64, resample if needed."""
-    data, fs = sf.read(path, dtype="float32", always_2d=True)
-    # Mix to mono
-    mono = data.mean(axis=1).astype(np.float64)
-    # Simple resample if sample rate differs
+    """Load a WAV file, convert to mono float32, resample if needed."""
+    mono, fs = read_wav(path)
+    target_fs = int(target_fs)
     if fs != target_fs:
-        from scipy.signal import resample_poly
-        from math import gcd
-        ratio_n = int(target_fs)
-        ratio_d = int(fs)
-        g = gcd(ratio_n, ratio_d)
-        mono = resample_poly(mono, ratio_n // g, ratio_d // g)
-        print(f"  Resampled {fs}Hz → {target_fs}Hz")
-    return mono.astype(np.float32), int(target_fs)
+        mono = resample_linear(mono, fs, target_fs)
+        print(f"  Resampled {fs}Hz -> {target_fs}Hz")
+    return mono.astype(np.float32), target_fs
 
 
 def process_preset(audio: np.ndarray, fs: int,
@@ -135,9 +187,8 @@ def process_sweep(audio: np.ndarray, fs: int,
 # ---------------------------------------------------------------------------
 
 def plot_spectrogram(ax, audio, fs, title, fmax=4000):
-    from scipy.signal import spectrogram as sg
-    f, t, Sxx = sg(audio.astype(np.float64), fs=fs,
-                   nperseg=1024, noverlap=768, scaling="spectrum")
+    f, t, Sxx = scipy_spectrogram(audio.astype(np.float64), fs=fs,
+                                  nperseg=1024, noverlap=768, scaling="spectrum")
     mask = f <= fmax
     Sxx_db = 10 * np.log10(np.maximum(Sxx[mask], 1e-12))
     ax.pcolormesh(t, f[mask], Sxx_db, shading="gouraud",
@@ -189,6 +240,10 @@ def make_report(input_path, outdir, results: dict, fs: int, sweep_out=None):
     Generate a multi-panel PDF/PNG report showing spectrograms for each
     preset and the vowel space positions.
     """
+    if not PLOTTING_AVAILABLE:
+        print("  Report skipped: install scipy and matplotlib for spectrogram plots")
+        return
+
     n_presets = len(results)
     fig = plt.figure(figsize=(16, 3 * (n_presets // 2 + 1) + 3))
     gs  = gridspec.GridSpec(n_presets // 2 + 2, 2,
@@ -249,14 +304,14 @@ def main():
         out = process_preset(audio, fs, x_pos, y_pos,
                              wah_wet, formant_wet, wah_Q, f1_Q, f2_Q, pre_drive)
         wav_path = os.path.join(args.outdir, f"{name}.wav")
-        sf.write(wav_path, out, fs)
+        write_wav(wav_path, out, fs)
         results[name] = out
 
     sweep_out = None
     if args.sweep:
         print("  Rendering vowel sweep...")
         sweep_out = process_sweep(audio, fs)
-        sf.write(os.path.join(args.outdir, "vowel_sweep.wav"), sweep_out, fs)
+        write_wav(os.path.join(args.outdir, "vowel_sweep.wav"), sweep_out, fs)
 
     print("Generating report...")
     make_report(args.input, args.outdir, results, fs, sweep_out)

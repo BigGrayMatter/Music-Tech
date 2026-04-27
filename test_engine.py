@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, ".")
 from formant_engine import (
     Biquad, EnvelopeFollower, FreqSmoother,
-    interpolate_vowel, VOWELS, VOWEL_TRAJECTORY,
+    interpolate_vowel, interpolate_f3, VOWELS, VOWEL_TRAJECTORY, FUZZ_MODES,
     PedalEngine, PedalParams
 )
 
@@ -131,6 +131,9 @@ def test_vowel_interpolation():
     results.append(check("Interpolation stays finite across [0,1]",
                    all(np.isfinite(f1) and np.isfinite(f2)
                        for f1, f2 in (interpolate_vowel(y) for y in np.linspace(0,1,100)))))
+    results.append(check("F3 interpolation stays in singer-formant range",
+                   all(2000 <= interpolate_f3(y) <= 3500
+                       for y in np.linspace(0,1,100))))
     return all(results)
 
 
@@ -212,6 +215,10 @@ def test_rapid_param_change():
         engine.params.wah_Q       = float(rng.uniform(0.5, 20))
         engine.params.f1_Q        = float(rng.uniform(1,   25))
         engine.params.f2_Q        = float(rng.uniform(1,   25))
+        engine.params.f3_Q        = float(rng.uniform(1,   25))
+        engine.params.f3_gain     = float(rng.uniform(0,    2))
+        engine.params.pre_emphasis_db = float(rng.uniform(-6, 12))
+        engine.params.fuzz_mode   = str(rng.choice(FUZZ_MODES))
         engine.params.wah_wet     = float(rng.random())
         engine.params.formant_wet = float(rng.random())
         block = noise[i*bs:(i+1)*bs]
@@ -220,6 +227,21 @@ def test_rapid_param_change():
             ok = False
             break
     return check("Rapid random parameter changes: no NaN/Inf in 5s", ok)
+
+
+def test_fuzz_modes_smoke():
+    """Every fuzz mode should process a block without NaN/Inf."""
+    x = np.linspace(-0.8, 0.8, 128, dtype=np.float32)
+    results = []
+    for mode in FUZZ_MODES:
+        engine = PedalEngine(fs=FS, block_size=128)
+        engine.params.pre_drive = 5.0
+        engine.params.fuzz_mode = mode
+        engine.params.pre_emphasis_db = 6.0
+        out = engine.process_block(x)
+        results.append(check(f"  fuzz mode '{mode}' finite",
+                             np.isfinite(out).all()))
+    return all(results)
 
 
 def test_display_state():
@@ -237,6 +259,8 @@ def test_display_state():
                          200 < state["f1_hz"] < 1200))
     results.append(check("f2_hz in range",
                          700 < state["f2_hz"] < 2800))
+    results.append(check("f3_hz in range",
+                         2000 < state["f3_hz"] < 3500))
     results.append(check("envelope >= 0",
                          state["envelope"] >= 0))
     return all(results)
@@ -254,6 +278,7 @@ if __name__ == "__main__":
         ("Frequency smoother convergence",     test_freq_smoother),
         ("Full engine smoke test",             test_engine_smoke),
         ("Rapid parameter changes",            test_rapid_param_change),
+        ("Fuzz modes smoke test",              test_fuzz_modes_smoke),
         ("Display state after block",          test_display_state),
     ]
 

@@ -46,7 +46,7 @@ import matplotlib.animation as animation
 
 from formant_engine import (
     PedalEngine, PedalParams, interpolate_vowel,
-    VOWELS, VOWEL_TRAJECTORY
+    VOWELS, VOWEL_TRAJECTORY, FUZZ_MODES
 )
 
 try:
@@ -223,21 +223,24 @@ class PlaytestGUI:
             ("",                None,             0,     1,     0,    3),
             ("Pre drive",       "pre_drive",      1.0,   8.0,   2.5,  4),
             ("Pre gain",        "pre_gain",       0.1,   4.0,   1.0,  5),
-            ("Output gain",     "output_gain",    0.1,   2.0,   0.7,  6),
-            ("",                None,             0,     1,     0,    7),
-            ("Wah wet",         "wah_wet",        0.0,   1.0,   0.8,  8),
-            ("Formant wet",     "formant_wet",    0.0,   1.0,   0.85, 9),
-            ("Formant gain",    "formant_gain",   0.1,   4.0,   1.5, 10),
-            ("",                None,             0,     1,     0,   11),
-            ("Wah Q",           "wah_Q",          0.5,  20.0,   4.0, 12),
-            ("F1 Q",            "f1_Q",           1.0,  25.0,  12.0, 13),
-            ("F2 Q",            "f2_Q",           1.0,  25.0,  14.0, 14),
-            ("",                None,             0,     1,     0,   15),
-            ("Env depth (Hz)",  "env_f2_depth_hz", 0,  500,  150.0, 16),
-            ("Env attack (ms)", "env_attack_ms",  1.0, 100.0,   5.0, 17),
-            ("Env release (ms)","env_release_ms", 5.0, 500.0,  80.0, 18),
-            ("",                None,             0,     1,     0,   19),
-            ("Model blend",     "model_blend",    0.0,   1.0,   1.0, 20),
+            ("Pre emphasis",    "pre_emphasis_db",-6.0,  12.0,   0.0,  6),
+            ("Output gain",     "output_gain",    0.1,   2.0,   0.7,  7),
+            ("",                None,             0,     1,     0,    8),
+            ("Wah wet",         "wah_wet",        0.0,   1.0,   0.8,  9),
+            ("Formant wet",     "formant_wet",    0.0,   1.0,   0.85, 10),
+            ("Formant gain",    "formant_gain",   0.1,   4.0,   1.5, 11),
+            ("F3 gain",         "f3_gain",         0.0,   2.0,   0.45, 12),
+            ("",                None,             0,     1,     0,   13),
+            ("Wah Q",           "wah_Q",          0.5,  20.0,   4.0, 14),
+            ("F1 Q",            "f1_Q",           1.0,  25.0,  12.0, 15),
+            ("F2 Q",            "f2_Q",           1.0,  25.0,  14.0, 16),
+            ("F3 Q",            "f3_Q",           1.0,  25.0,  10.0, 17),
+            ("",                None,             0,     1,     0,   18),
+            ("Env depth (Hz)",  "env_f2_depth_hz", 0,  500,  150.0, 19),
+            ("Env attack (ms)", "env_attack_ms",  1.0, 100.0,   5.0, 20),
+            ("Env release (ms)","env_release_ms", 5.0, 500.0,  80.0, 21),
+            ("",                None,             0,     1,     0,   22),
+            ("Model blend",     "model_blend",    0.0,   1.0,   1.0, 23),
         ]
 
         for label, attr, lo, hi, default, row in slider_defs:
@@ -269,6 +272,22 @@ class PlaytestGUI:
                           variable=val_var, length=200, command=_make_cb())
             s.grid(row=row, column=1, sticky="ew", padx=4)
             self._sliders[attr] = (s, val_var, val_lbl)
+
+        ttk.Label(left, text="Fuzz mode", width=18, anchor="e"
+                  ).grid(row=8, column=0, sticky="e", padx=4, pady=1)
+        self._fuzz_var = tk.StringVar(value=self.engine.params.fuzz_mode)
+        fuzz_box = ttk.Combobox(
+            left,
+            textvariable=self._fuzz_var,
+            values=FUZZ_MODES,
+            state="readonly",
+            width=14,
+        )
+        fuzz_box.grid(row=8, column=1, sticky="ew", padx=4)
+        fuzz_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: setattr(self.engine.params, "fuzz_mode", self._fuzz_var.get()),
+        )
 
         # ── Right top: waveform ───────────────────────────────────────
         self.wave_frame = ttk.Frame(right)
@@ -364,7 +383,7 @@ class PlaytestGUI:
         state = self.engine.get_display_state()
 
         # Update vowel cursor
-        f1, f2 = state["f1_hz"], state["f2_hz"]
+        f1, f2, f3 = state["f1_hz"], state["f2_hz"], state["f3_hz"]
         self._vowel_cursor.set_data([f1], [f2])
 
         # Update wah line (show wah frequency on Y axis as horizontal ref)
@@ -385,7 +404,7 @@ class PlaytestGUI:
         # Status bar
         self.status_var.set(
             f"Wah: {wah_hz:.0f} Hz  |  F1: {f1:.0f} Hz  |  "
-            f"F2: {f2:.0f} Hz  |  Env: {state['envelope']:.3f}"
+            f"F2: {f2:.0f} Hz  |  F3: {f3:.0f} Hz  |  Env: {state['envelope']:.3f}"
         )
 
         self.root.after(50, self._update_display)   # ~20 Hz refresh

@@ -52,9 +52,19 @@ VOWELS: dict[str, tuple[float, float]] = {
     "EE": (300, 2300),   # as in "feet"
 }
 
+VOWEL_F3: dict[str, float] = {
+    "OO": 2400,
+    "OH": 2600,
+    "AH": 2800,
+    "AE": 3000,
+    "EE": 3200,
+}
+
 # Default sweep trajectory (Y=0 → OO, Y=1 → EE)
 # You can reorder this or make it genre-dependent later.
 VOWEL_TRAJECTORY = ["OO", "OH", "AH", "AE", "EE"]
+
+FUZZ_MODES = ("tanh", "asymmetric", "hardclip", "foldback", "diode")
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +120,25 @@ class Biquad:
         a0    =  1 + alpha / A
         a1    = -2 * np.cos(w0)
         a2    =  1 - alpha / A
+        self.b = np.array([b0 / a0, b1 / a0, b2 / a0])
+        self.a = np.array([a1 / a0, a2 / a0])
+
+    def set_high_shelf(self, f0: float, gain_db: float, fs: float, slope: float = 1.0):
+        """High-shelf EQ for feeding more upper harmonics into the formants."""
+        f0 = np.clip(f0, 20.0, fs * 0.49)
+        A = 10 ** (gain_db / 40.0)
+        w0 = 2 * np.pi * f0 / fs
+        alpha = np.sin(w0) / 2 * np.sqrt((A + 1 / A) * (1 / max(slope, 0.1) - 1) + 2)
+        cos_w0 = np.cos(w0)
+        sqrt_A = np.sqrt(A)
+
+        b0 = A * ((A + 1) + (A - 1) * cos_w0 + 2 * sqrt_A * alpha)
+        b1 = -2 * A * ((A - 1) + (A + 1) * cos_w0)
+        b2 = A * ((A + 1) + (A - 1) * cos_w0 - 2 * sqrt_A * alpha)
+        a0 = (A + 1) - (A - 1) * cos_w0 + 2 * sqrt_A * alpha
+        a1 = 2 * ((A - 1) - (A + 1) * cos_w0)
+        a2 = (A + 1) - (A - 1) * cos_w0 - 2 * sqrt_A * alpha
+
         self.b = np.array([b0 / a0, b1 / a0, b2 / a0])
         self.a = np.array([a1 / a0, a2 / a0])
 
@@ -224,6 +253,72 @@ def interpolate_vowel(y_pos: float,
             f2_a + t * (f2_b - f2_a))
 
 
+def interpolate_f3(y_pos: float,
+                   trajectory: list[str] = VOWEL_TRAJECTORY,
+                   f3_targets: dict = VOWEL_F3) -> float:
+    """Map a scalar y_pos in [0, 1] to an F3 / singer-resonance target."""
+    y_pos = np.clip(y_pos, 0.0, 1.0)
+    n_segments = len(trajectory) - 1
+    scaled = y_pos * n_segments
+    idx    = int(scaled)
+    t      = scaled - idx
+    if idx >= n_segments:
+        return f3_targets[trajectory[-1]]
+    f3_a = f3_targets[trajectory[idx]]
+    f3_b = f3_targets[trajectory[idx + 1]]
+    return f3_a + t * (f3_b - f3_a)
+
+
+def fuzz_tanh(x: np.ndarray, drive: float) -> np.ndarray:
+    return np.tanh(drive * x) / np.tanh(drive)
+
+
+def fuzz_asymmetric(x: np.ndarray, drive: float) -> np.ndarray:
+    gained = x * drive
+    pos = np.where(gained > 0, np.tanh(gained * 1.4) * 0.7, 0.0)
+    neg = np.where(gained <= 0, -np.tanh(-gained * 0.9), 0.0)
+    return (pos + neg) / max(drive * 0.9, 1e-10)
+
+
+def fuzz_hardclip(x: np.ndarray, drive: float) -> np.ndarray:
+    return np.clip(x * drive, -1.0, 1.0) / max(drive, 1e-10)
+
+
+def fuzz_foldback(x: np.ndarray, drive: float) -> np.ndarray:
+    gained = x * drive
+    threshold = 0.8
+    s_norm = gained / threshold
+    folded = (np.abs(((s_norm - 1) % 4) - 2) - 1) * threshold
+    return folded / max(drive, 1e-10)
+
+
+def fuzz_diode(x: np.ndarray, drive: float) -> np.ndarray:
+    gained = x * drive
+    vf_pos = 0.4
+    vf_neg = 0.8
+
+    def diode_clip(v, vf):
+        return np.where(
+            np.abs(v) < vf,
+            v,
+            np.sign(v) * (vf + np.log1p(np.abs(v) - vf + 1e-10) * 0.4),
+        )
+
+    out = np.where(gained >= 0, diode_clip(gained, vf_pos), 0.0)
+    out += np.where(gained < 0, diode_clip(gained, vf_neg), 0.0)
+    peak = np.percentile(np.abs(out), 99) + 1e-10
+    return out / peak * 0.85
+
+
+FUZZ_MODEL_FUNCS = {
+    "tanh": fuzz_tanh,
+    "asymmetric": fuzz_asymmetric,
+    "hardclip": fuzz_hardclip,
+    "foldback": fuzz_foldback,
+    "diode": fuzz_diode,
+}
+
+
 def blend_with_model(model_f1: float, model_f2: float,
                      manual_f1: float, manual_f2: float,
                      blend: float) -> tuple[float, float]:
@@ -258,11 +353,15 @@ class PedalParams:
     # 1.0 = clean (no effect), 2.0 = mild warmth, 4.0+ = obvious drive.
     # This is the most important knob for making formants audible on guitar.
     pre_drive:  float = 1.0
+    fuzz_mode:  str = "tanh"
+    pre_emphasis_db: float = 0.0
 
     # Formant filters — pure bandpass, Q controls bandwidth
     # Higher Q = narrower, more nasal/robotic. 8-14 is musical, 16-22 is obvious.
     f1_Q:       float = 12.0
     f2_Q:       float = 14.0
+    f3_Q:       float = 10.0
+    f3_gain:    float = 0.45
     # Relative gain of the reconstructed formant signal before the wet/dry blend.
     # Raise this if the formant effect feels too quiet at high formant_wet values.
     formant_gain: float = 1.5
@@ -288,6 +387,7 @@ class PedalParams:
     # Active genre model prediction (set by ML model, None = bypass)
     model_f1: Optional[float] = None
     model_f2: Optional[float] = None
+    model_f3: Optional[float] = None
 
 
 class PedalEngine:
@@ -302,9 +402,11 @@ class PedalEngine:
         self.params     = PedalParams()
 
         # Filters
-        self.wah_bpf = Biquad()
-        self.f1_bpf  = Biquad()
-        self.f2_bpf  = Biquad()
+        self.pre_emphasis = Biquad()
+        self.wah_bpf      = Biquad()
+        self.f1_bpf       = Biquad()
+        self.f2_bpf       = Biquad()
+        self.f3_bpf       = Biquad()
 
         # Envelope followers — fast tracks attacks, slow tracks sustain.
         # Transient delta (fast - slow) gives a clean per-attack F2 nudge
@@ -325,9 +427,12 @@ class PedalEngine:
         self.wah_smoother = FreqSmoother(wah_init, self.params.wah_smooth_ms,
                                          fs, block_size)
         f1_init, f2_init  = interpolate_vowel(self.params.y_pos)
+        f3_init = interpolate_f3(self.params.y_pos)
         self.f1_smoother  = FreqSmoother(f1_init, self.params.formant_smooth_ms,
                                          fs, block_size)
         self.f2_smoother  = FreqSmoother(f2_init, self.params.formant_smooth_ms,
+                                         fs, block_size)
+        self.f3_smoother  = FreqSmoother(f3_init, self.params.formant_smooth_ms,
                                          fs, block_size)
 
         # Update coefficients with initial params
@@ -341,34 +446,43 @@ class PedalEngine:
         p = self.params
         return p.wah_f_min + p.x_pos * (p.wah_f_max - p.wah_f_min)
 
-    def _formant_targets(self, f2_env_offset: float) -> tuple[float, float]:
+    def _formant_targets(self, f2_env_offset: float) -> tuple[float, float, float]:
         p = self.params
         manual_f1, manual_f2 = interpolate_vowel(p.y_pos)
+        manual_f3 = interpolate_f3(p.y_pos)
         if p.model_f1 is not None and p.model_f2 is not None:
             f1, f2 = blend_with_model(p.model_f1, p.model_f2,
                                       manual_f1, manual_f2, p.model_blend)
         else:
             f1, f2 = manual_f1, manual_f2
+        if p.model_f3 is not None:
+            f3 = (1 - p.model_blend) * p.model_f3 + p.model_blend * manual_f3
+        else:
+            f3 = manual_f3
         f2 += f2_env_offset
-        return f1, f2
+        return f1, f2, f3
 
     def _update_coefficients(self, f2_env_offset: float):
         p  = self.params
         fs = self.fs
 
         wah_f = self.wah_smoother.update(self._wah_target())
-        f1_t, f2_t = self._formant_targets(f2_env_offset)
+        f1_t, f2_t, f3_t = self._formant_targets(f2_env_offset)
         f1_f  = self.f1_smoother.update(f1_t)
         f2_f  = self.f2_smoother.update(f2_t)
+        f3_f  = self.f3_smoother.update(f3_t)
 
+        self.pre_emphasis.set_high_shelf(1000.0, p.pre_emphasis_db, fs)
         self.wah_bpf.set_bandpass(wah_f, p.wah_Q, fs)
         self.f1_bpf.set_bandpass(f1_f, p.f1_Q, fs)
         self.f2_bpf.set_bandpass(f2_f, p.f2_Q, fs)
+        self.f3_bpf.set_bandpass(f3_f, p.f3_Q, fs)
 
         # Store current smoothed values for the GUI to read
         self._current_wah_f = wah_f
         self._current_f1    = f1_f
         self._current_f2    = f2_f
+        self._current_f3    = f3_f
 
     # ------------------------------------------------------------------
     # Public API
@@ -398,7 +512,8 @@ class PedalEngine:
 
         # Pre-drive: tanh normalised for unity gain at small signals
         if p.pre_drive > 1.001:
-            driven = np.tanh(p.pre_drive * x) / np.tanh(p.pre_drive)
+            fuzz_fn = FUZZ_MODEL_FUNCS.get(p.fuzz_mode, fuzz_tanh)
+            driven = fuzz_fn(x, p.pre_drive)
         else:
             driven = x
 
@@ -415,14 +530,21 @@ class PedalEngine:
         self._update_coefficients(f2_env_offset)
 
         # Wah BPF — applied as wet/dry on the driven signal
-        wah_out = self.wah_bpf.process_block(driven)
-        wah_mix = (1 - p.wah_wet) * driven + p.wah_wet * wah_out
+        if abs(p.pre_emphasis_db) > 0.01:
+            formant_input = self.pre_emphasis.process_block(driven)
+        else:
+            formant_input = driven
+
+        wah_out = self.wah_bpf.process_block(formant_input)
+        wah_mix = (1 - p.wah_wet) * formant_input + p.wah_wet * wah_out
 
         # Vocal tract: F1 and F2 pure bandpass filters in parallel, summed
         # This IS the processed signal — no dry inside the formant chain
         f1_out      = self.f1_bpf.process_block(wah_mix)
         f2_out      = self.f2_bpf.process_block(wah_mix)
-        vocal_tract = (f1_out + f2_out) * 0.5 * p.formant_gain
+        f3_out      = self.f3_bpf.process_block(wah_mix) * p.f3_gain
+        vocal_tract = (f1_out + f2_out + f3_out) / (2.0 + p.f3_gain)
+        vocal_tract *= p.formant_gain
 
         # Blend: formant_wet=1.0 → pure vocal tract, =0.0 → dry pass-through
         output = (1.0 - p.formant_wet) * wah_mix + p.formant_wet * vocal_tract
@@ -440,6 +562,7 @@ class PedalEngine:
             "wah_hz":  getattr(self, "_current_wah_f", 0.0),
             "f1_hz":   getattr(self, "_current_f1",    0.0),
             "f2_hz":   getattr(self, "_current_f2",    0.0),
+            "f3_hz":   getattr(self, "_current_f3",    0.0),
             "x_pos":   self.params.x_pos,
             "y_pos":   self.params.y_pos,
             "envelope": self.env_follower.envelope,
@@ -447,8 +570,10 @@ class PedalEngine:
         }
 
     def reset(self):
+        self.pre_emphasis.reset()
         self.wah_bpf.reset()
         self.f1_bpf.reset()
         self.f2_bpf.reset()
+        self.f3_bpf.reset()
         self.env_follower.reset()
         self.env_follower_slow.reset()
