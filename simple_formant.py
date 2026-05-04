@@ -1,140 +1,143 @@
 """
 simple_formant.py
 -----------------
-Offline vowel/formant filter demo for electric guitar.
-Processes a WAV file and writes an output you can listen to.
+All-pole vocal tract filter for guitar — talk box emulation.
 
-Signal path:
-  clean input
-    → fuzz (harmonic enrichment)
-    → high-shelf pre-emphasis (tilt spectral energy toward F2/F3)
-    → F1 + F2 + F3 peaking EQ filters (parallel vocal-tract resonances)
-    → wet/dry blend with clean input
-    → RMS normalise
+WHY THIS SOUNDS DIFFERENT FROM THE PREVIOUS VERSION
+----------------------------------------------------
+Old: parallel peaking EQs at F1/F2/F3 → sounds like wah (it IS a wah).
+New: cascade of all-pole resonators (F1–F5) → real vocal tract model.
 
-Install deps:  pip install numpy scipy soundfile matplotlib
-Run:           python3 simple_formant.py
+A vocal tract is a tube — a physical all-pole resonant system. Cascading
+resonators creates anti-formant notches BETWEEN the peaks through the
+natural interaction of the sections. Those notches are exactly what makes
+vowels sound like vowels rather than a wah pedal.
+
+The source signal also must be near-square-wave rich in harmonics. A talk
+box uses a power amp driven to full saturation. We approximate this with a
+hard-clip saturator at high drive.
+
+Install: pip install numpy scipy soundfile
+Run:     python3 simple_formant.py
 """
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import lfilter
+from scipy.signal import sosfilt
 
 # ─────────────────────────────────────────────
-#  SETTINGS — edit these
+#  SETTINGS
 # ─────────────────────────────────────────────
 
 INPUT_FILE  = "ElecGtr.wav"
 OUTPUT_FILE = "output.wav"
 
-# Pick one key from VOWELS below
 VOWEL_TARGET = "AH"
 
-VOWELS = {
-    "OO": (300,   900),   # "boot"   — dark, hollow
-    "OH": (500,  1000),   # "go"     — rounded
-    "AH": (800,  1200),   # "father" — open, neutral (good test vowel)
-    "AE": (700,  1800),   # "cat"    — nasal, forward
-    "EE": (300,  2300),   # "feet"   — bright, sharp
+# Full 5-formant vocal tract data (F1–F5 Hz).
+# From Hillenbrand et al. (1995), American English male speaker averages.
+# All 5 formants needed for convincing vowel identity — F4/F5 add the
+# "air" and brightness that distinguish vowels from wah-filter shapes.
+VOWEL_FORMANTS = {
+    #         F1    F2    F3    F4    F5
+    "OO": (  300,   870, 2240, 3180, 3800),   # "boot"  — dark, hollow
+    "OH": (  500,  1000, 2500, 3300, 4000),   # "go"    — rounded
+    "AH": (  800,  1200, 2500, 3300, 4000),   # "father"— open, neutral
+    "AE": (  600,  1900, 2600, 3300, 4200),   # "cat"   — nasal, forward
+    "EE": (  300,  2300, 3000, 3600, 4300),   # "feet"  — bright, sharp
 }
 
-# F3 (third formant) — adds clarity/brightness, especially for EE/AE.
-# These are real acoustic phonetics values, NOT uniform-step placeholders.
-VOWEL_F3 = {
-    "OO": 2500,
-    "OH": 2600,
-    "AH": 2550,   # dips for open back vowels — does NOT climb linearly
-    "AE": 2900,
-    "EE": 3100,
-}
+# Formant bandwidths (Hz) — independent of formant frequency.
+# Real vocal tract bandwidths: F1≈60Hz, F2≈90Hz, F3≈150Hz, F4≈200Hz, F5≈250Hz.
+# These are NOT Q-based (BW doesn't scale with frequency here).
+FORMANT_BW = (60.0, 90.0, 150.0, 200.0, 250.0)
 
-# ── Filter bandwidth (Q) ──────────────────────────────────────────────────────
-# Lower Q = wider peak = more natural vowel sound.
-# Q=12 (old default) was far too narrow — it produced comb-filter artefacts,
-# not vowel resonances. Real speech formant bandwidths:
-#   F1: ~100-200 Hz → Q ≈ 3-5   at 300-800 Hz
-#   F2: ~100-150 Hz → Q ≈ 10-15 at 1000-2300 Hz
-#   F3: ~150-200 Hz → Q ≈ 8-12  at 2500-3100 Hz
-F1_Q = 4.0
-F2_Q = 10.0
-F3_Q = 8.0
+# ── Source saturation ────────────────────────────────────────────────────────
+# A talk box uses a saturated power amp — output is near a square wave.
+# "saturate" = hard clip, no output normalization → maximum harmonic density.
+# Drive 8–12 recommended. Lower values reduce vowel audibility.
+FUZZ_DRIVE = 10.0
+FUZZ_MODE  = "saturate"
 
-# ── Formant peak boost ────────────────────────────────────────────────────────
-# Peaking EQ (not pure BPF): boosts at the formant frequency while preserving
-# the rest of the spectrum. F2 gets 3 dB less, F3 gets 6 dB less than F1.
-# 18 dB is a good balance — audible vowel colour without sounding like a synth.
-FORMANT_PEAK_DB = 18.0
+# ── Spectral tilt compensation ───────────────────────────────────────────────
+# Guitar harmonics roll off at ~-6 dB/oct. This shelf tilts the saturated
+# signal back up so F3/F4/F5 have enough energy to be shaped by the filter.
+PRE_EMPHASIS_DB = 6.0
 
-# ── Wet/dry ───────────────────────────────────────────────────────────────────
-# 1.0 = pure vowel filter (dry signal is pre-drive clean input).
-# 0.0 = clean dry pass-through (no processing).
-FORMANT_WET = 0.95
-
-# ── Fuzz ─────────────────────────────────────────────────────────────────────
-# Drive MUST be significant (4-8) for formants to be audible on guitar.
-# Clean guitar is harmonically sparse — the fuzz fills in the harmonic series
-# that the formant filters then shape. Without it, vowels are inaudible.
-FUZZ_DRIVE = 6.0
-FUZZ_MODE  = "diode"   # "tanh" | "asymmetric" | "hardclip" | "foldback" | "diode"
-
-# ── Pre-emphasis ──────────────────────────────────────────────────────────────
-# High-shelf boost (dB) above 1 kHz applied after fuzz, before formant filters.
-# Guitar harmonics naturally roll off; this tilt compensates so F2/F3
-# have energy to shape. 8 dB is a reasonable starting point.
-PRE_EMPHASIS_DB = 8.0
+# ── Wet/dry blend ─────────────────────────────────────────────────────────────
+# 1.0 = pure vocal tract (talk box). 0.8–0.9 = blended, less aggressive.
+FORMANT_WET = 1.0
 
 
 # ─────────────────────────────────────────────
-#  DSP
+#  DSP — ALL-POLE VOCAL TRACT FILTER
 # ─────────────────────────────────────────────
 
-def make_peaking_coeffs(f0, Q, gain_db, fs):
+def make_vocal_tract_sos(formants_hz, bandwidths_hz, fs):
     """
-    Peaking EQ biquad (Audio EQ Cookbook).
-    Boosts at f0 by gain_db dB with bandwidth controlled by Q.
-    Unlike a BPF, passes the full signal and adds a resonant peak.
-    Returns (b, a) for scipy.signal.lfilter.
+    Build the vocal tract filter as a cascade of 2nd-order all-pole
+    resonators in SOS (second-order sections) form.
+
+    Each formant becomes a conjugate pole pair at radius r, angle w:
+        H_k(z) = b0_k / (1 + a1_k*z^-1 + a2_k*z^-2)
+        r_k    = exp(-π * BW_k / fs)
+        b0_k   = 1 + a1_k + a2_k  →  unity DC gain per section
+
+    The FULL CASCADE (not parallel sum) naturally produces anti-formant
+    notches between peaks through interaction of the sections — this is
+    what the vocal tract actually does as a physical tube, and what
+    distinguishes this from a parallel peaking EQ (= wah pedal).
+
+    Uses SOS form for numerical stability (avoids coefficient round-off
+    in a single high-order polynomial representation).
+
+    Returns SOS array (n_formants × 6) for scipy.signal.sosfilt.
     """
-    f0 = np.clip(f0, 20.0, fs * 0.49)
-    Q  = max(Q, 0.1)
-    A     = 10 ** (gain_db / 40.0)
-    w0    = 2 * np.pi * f0 / fs
-    alpha = np.sin(w0) / (2 * Q)
-    b0 =  1 + alpha * A
-    b1 = -2 * np.cos(w0)
-    b2 =  1 - alpha * A
-    a0 =  1 + alpha / A
-    a1 = -2 * np.cos(w0)
-    a2 =  1 - alpha / A
-    return (np.array([b0, b1, b2]) / a0,
-            np.array([1.0, a1 / a0, a2 / a0]))
+    sos = []
+    for fk, bwk in zip(formants_hz, bandwidths_hz):
+        fk = float(np.clip(fk, 20.0, fs * 0.49))
+        rk = float(np.exp(-np.pi * bwk / fs))
+        wk = 2.0 * np.pi * fk / fs
+        a1 = -2.0 * rk * np.cos(wk)
+        a2 = rk ** 2
+        b0 = 1.0 + a1 + a2   # A(1): unity DC gain
+        sos.append([b0, 0.0, 0.0, 1.0, a1, a2])
+    return np.array(sos, dtype=np.float64)
 
 
-def make_high_shelf_coeffs(shelf_hz, gain_db, fs):
-    """High-shelf biquad for pre-emphasis (Audio EQ Cookbook §HS)."""
+def make_high_shelf_sos(shelf_hz, gain_db, fs):
+    """High-shelf filter for spectral tilt compensation (SOS form)."""
     A      = 10 ** (gain_db / 40.0)
     w0     = 2 * np.pi * np.clip(shelf_hz, 20, fs * 0.49) / fs
-    alpha  = np.sin(w0) / 2 * np.sqrt(2)   # slope = 1
-    cos_w0 = np.cos(w0)
-    sqrt_A = np.sqrt(A)
-    b0 =      A * ((A + 1) + (A - 1) * cos_w0 + 2 * sqrt_A * alpha)
-    b1 = -2 * A * ((A - 1) + (A + 1) * cos_w0)
-    b2 =      A * ((A + 1) + (A - 1) * cos_w0 - 2 * sqrt_A * alpha)
-    a0 =           (A + 1) - (A - 1) * cos_w0 + 2 * sqrt_A * alpha
-    a1 =  2 *     ((A - 1) - (A + 1) * cos_w0)
-    a2 =           (A + 1) - (A - 1) * cos_w0 - 2 * sqrt_A * alpha
-    return np.array([b0, b1, b2]) / a0, np.array([1.0, a1 / a0, a2 / a0])
+    alpha  = np.sin(w0) / 2 * np.sqrt(2)
+    cw     = np.cos(w0)
+    sA     = np.sqrt(A)
+    b0 =      A * ((A+1) + (A-1)*cw + 2*sA*alpha)
+    b1 = -2 * A * ((A-1) + (A+1)*cw)
+    b2 =      A * ((A+1) + (A-1)*cw - 2*sA*alpha)
+    a0 =           (A+1) - (A-1)*cw + 2*sA*alpha
+    a1 =  2 *     ((A-1) - (A+1)*cw)
+    a2 =           (A+1) - (A-1)*cw - 2*sA*alpha
+    return np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]])
 
 
-# ── Fuzz models ───────────────────────────────────────────────────────────────
+# ── Fuzz / saturation models ──────────────────────────────────────────────────
+
+def fuzz_saturate(x, drive):
+    """
+    Hard clip to ±1 after gain. No output normalization.
+    At drive=10, any guitar signal > 0.1 amplitude clips to ±1 →
+    output approaches a square wave → maximum harmonic density.
+    This most closely matches a saturated power amp in a real talk box.
+    """
+    return np.clip(x * drive, -1.0, 1.0)
+
 
 def fuzz_tanh(x, drive):
-    """Smooth symmetric soft clip. Only odd harmonics."""
     return np.tanh(drive * x) / np.tanh(drive)
 
 
 def fuzz_asymmetric(x, drive):
-    """Asymmetric clip — adds even harmonics, warmer/more organic."""
     gained = x * drive
     pos = np.where(gained > 0, np.tanh(gained * 1.4) * 0.7, 0.0)
     neg = np.where(gained <= 0, -np.tanh(-gained * 0.9), 0.0)
@@ -142,34 +145,18 @@ def fuzz_asymmetric(x, drive):
 
 
 def fuzz_hardclip(x, drive):
-    """Brick-wall clip. Very buzzy — lots of high-order harmonics."""
     return np.clip(x * drive, -1.0, 1.0) / max(drive, 1e-10)
 
 
-def fuzz_foldback(x, drive):
-    """Signal folds back when it exceeds threshold. Harsh, spitting."""
-    gained = x * drive
-    threshold = 0.8
-    s_norm = gained / threshold
-    folded = (np.abs(((s_norm - 1) % 4) - 2) - 1) * threshold
-    return folded / max(drive, 1e-10)
-
-
 def fuzz_diode(x, drive):
-    """
-    Diode clipper approximation — exponential soft knee, asymmetric.
-    Closest to a real fuzz/overdrive circuit. Recommended default.
-    """
     gained = x * drive
     vf_pos, vf_neg = 0.4, 0.8
-
     def diode_clip(v, vf):
         return np.where(
             np.abs(v) < vf,
             v,
             np.sign(v) * (vf + np.log1p(np.abs(v) - vf + 1e-10) * 0.4),
         )
-
     out  = np.where(gained >= 0, diode_clip(gained, vf_pos), 0.0)
     out += np.where(gained <  0, diode_clip(gained, vf_neg), 0.0)
     peak = np.percentile(np.abs(out), 99) + 1e-10
@@ -177,104 +164,53 @@ def fuzz_diode(x, drive):
 
 
 FUZZ_MODELS = {
+    "saturate":   fuzz_saturate,
     "tanh":       fuzz_tanh,
     "asymmetric": fuzz_asymmetric,
     "hardclip":   fuzz_hardclip,
-    "foldback":   fuzz_foldback,
     "diode":      fuzz_diode,
 }
 
 
-def apply_formant(signal, vowel, vowels, vowel_f3,
-                  f1_q, f2_q, f3_q, formant_peak_db,
+def apply_formant(signal, vowel, vowel_formants, formant_bw,
                   fuzz_drive, fuzz_mode, pre_emphasis_db, wet, fs):
     """
-    Apply the vocal-tract formant filter to a mono signal.
+    All-pole vocal tract filter.
 
-    Key design choices vs. earlier versions:
-      - Peaking EQ (not pure BPF): preserves the full-bandwidth signal and
-        adds resonant peaks. Pure BPF at high wet removed everything between
-        the bands, which sounded robotic rather than vowel-like.
-      - Low F1_Q (4): natural F1 bandwidth ~75-200 Hz matches real speech.
-        The old Q=12 gave ~25-67 Hz — impossibly narrow, not a vowel.
-      - Weighted sum: F1 > F2 > F3, matching natural vowel spectral shape.
-      - Dry blend is against the pre-drive clean signal, not post-fuzz.
+    Signal path:
+      x_clean
+        → hard-clip saturator  (near-square-wave source)
+        → high-shelf emphasis  (tilt spectrum for F3–F5 energy)
+        → all-pole vocal tract (cascade of F1–F5 resonators via sosfilt)
+        → wet/dry blend with x_clean
+        → RMS normalise to -12 dBFS
     """
-    f1_hz, f2_hz = vowels[vowel]
-    f3_hz = vowel_f3[vowel]
-    x = signal.astype(np.float64)   # clean reference for dry blend
+    formants = vowel_formants[vowel]
+    x = signal.astype(np.float64)
 
-    # Fuzz: fills the harmonic series so formant filters have energy to shape.
+    # Saturate: creates a harmonic-dense source the vocal tract can shape.
     driven = FUZZ_MODELS[fuzz_mode](x, fuzz_drive)
 
-    # Pre-emphasis: boost highs so F2/F3 have comparable energy to F1.
+    # Pre-emphasis: tilt spectrum so high formants have energy to shape.
     if pre_emphasis_db > 0.0:
-        b_shelf, a_shelf = make_high_shelf_coeffs(1000.0, pre_emphasis_db, fs)
-        emphasized = lfilter(b_shelf, a_shelf, driven)
+        shelf_sos = make_high_shelf_sos(1000.0, pre_emphasis_db, fs)
+        emphasized = sosfilt(shelf_sos, driven)
     else:
         emphasized = driven
 
-    # Three parallel peaking EQ filters (vocal tract resonances).
-    # F2 gets -3 dB, F3 gets -6 dB relative to F1 — natural amplitude taper.
-    b1, a1 = make_peaking_coeffs(f1_hz, f1_q, formant_peak_db,       fs)
-    b2, a2 = make_peaking_coeffs(f2_hz, f2_q, formant_peak_db - 3.0, fs)
-    b3, a3 = make_peaking_coeffs(f3_hz, f3_q, formant_peak_db - 6.0, fs)
+    # All-pole vocal tract: cascade of 5 resonators applied in series.
+    vt_sos  = make_vocal_tract_sos(formants, formant_bw, fs)
+    filtered = sosfilt(vt_sos, emphasized)
 
-    f1_out = lfilter(b1, a1, emphasized)
-    f2_out = lfilter(b2, a2, emphasized)
-    f3_out = lfilter(b3, a3, emphasized)
+    # Wet/dry: dry = pre-drive clean signal.
+    out = (1.0 - wet) * x + wet * filtered
 
-    # Weighted sum: F1 loudest, F2 slightly less, F3 subtle.
-    vocal_tract = f1_out * 0.55 + f2_out * 0.35 + f3_out * 0.10
-
-    # Blend clean (pre-drive) input with the formant-filtered signal.
-    # At wet=1.0: pure vowel filter. At wet=0.0: clean dry guitar.
-    out = (1.0 - wet) * x + wet * vocal_tract
-
-    # RMS normalise to -12 dBFS (more robust than peak normalisation).
+    # RMS normalise to -12 dBFS.
     rms = np.sqrt(np.mean(out ** 2))
     if rms > 1e-8:
-        out = out * (10 ** (-12 / 20) / rms)
+        out = out * (10 ** (-12.0 / 20.0) / rms)
 
     return np.clip(out, -1.0, 1.0).astype(np.float32)
-
-
-# ─────────────────────────────────────────────
-#  OPTIONAL: plot fuzz transfer curves
-# ─────────────────────────────────────────────
-
-def plot_transfer_curves():
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not installed — skipping plot")
-        return
-
-    x = np.linspace(-1, 1, 1000)
-    fig, axes = plt.subplots(1, len(FUZZ_MODELS), figsize=(14, 3))
-    fig.suptitle(f"Fuzz transfer curves  (drive={FUZZ_DRIVE})", fontsize=11)
-
-    for ax, (name, fn) in zip(axes, FUZZ_MODELS.items()):
-        y = fn(x, FUZZ_DRIVE)
-        ax.plot(x, y, linewidth=1.5)
-        ax.plot(x, x, color="gray", linewidth=0.5, linestyle="--")
-        ax.set_title(name, fontsize=9)
-        ax.set_xlim(-1, 1)
-        ax.set_ylim(-1.2, 1.2)
-        ax.axhline(0, color="black", linewidth=0.3)
-        ax.axvline(0, color="black", linewidth=0.3)
-        ax.set_xlabel("input")
-        if ax is axes[0]:
-            ax.set_ylabel("output")
-        ax.grid(True, alpha=0.2)
-        asymmetry = np.mean(np.abs(y + y[::-1]))
-        ax.text(0.05, 0.92, f"asymm={asymmetry:.3f}",
-                transform=ax.transAxes, fontsize=7, color="gray")
-
-    plt.tight_layout()
-    plt.savefig("fuzz_curves.png", dpi=120, bbox_inches="tight")
-    print("Saved fuzz_curves.png")
-    plt.close()
 
 
 # ─────────────────────────────────────────────
@@ -282,28 +218,26 @@ def plot_transfer_curves():
 # ─────────────────────────────────────────────
 
 def main():
-    assert VOWEL_TARGET in VOWELS, \
-        f"'{VOWEL_TARGET}' not in VOWELS. Choose from: {list(VOWELS)}"
+    assert VOWEL_TARGET in VOWEL_FORMANTS, \
+        f"'{VOWEL_TARGET}' not in VOWEL_FORMANTS. Choose from: {list(VOWEL_FORMANTS)}"
     assert FUZZ_MODE in FUZZ_MODELS, \
         f"'{FUZZ_MODE}' not in FUZZ_MODELS. Choose from: {list(FUZZ_MODELS)}"
-
-    plot_transfer_curves()
 
     print(f"Loading  {INPUT_FILE}")
     audio, fs = sf.read(INPUT_FILE, dtype="float32", always_2d=True)
     mono = audio.mean(axis=1)
     print(f"  {len(mono)/fs:.2f}s  @{fs}Hz")
 
-    f1, f2 = VOWELS[VOWEL_TARGET]
-    f3 = VOWEL_F3[VOWEL_TARGET]
-    print(f"Vowel '{VOWEL_TARGET}'  F1={f1}Hz  F2={f2}Hz  F3={f3}Hz")
-    print(f"Q     F1={F1_Q}  F2={F2_Q}  F3={F3_Q}  peak={FORMANT_PEAK_DB}dB")
+    formants = VOWEL_FORMANTS[VOWEL_TARGET]
+    labels   = ["F1", "F2", "F3", "F4", "F5"]
+    print(f"Vowel '{VOWEL_TARGET}'")
+    print(f"  " + "  ".join(f"{l}={f:.0f}Hz" for l, f in zip(labels, formants)))
+    print(f"  BW: " + "  ".join(f"{b:.0f}Hz" for b in FORMANT_BW))
     print(f"Fuzz  mode={FUZZ_MODE}  drive={FUZZ_DRIVE}  emphasis={PRE_EMPHASIS_DB}dB")
     print(f"Wet={FORMANT_WET}")
 
     out = apply_formant(
-        mono, VOWEL_TARGET, VOWELS, VOWEL_F3,
-        F1_Q, F2_Q, F3_Q, FORMANT_PEAK_DB,
+        mono, VOWEL_TARGET, VOWEL_FORMANTS, FORMANT_BW,
         FUZZ_DRIVE, FUZZ_MODE, PRE_EMPHASIS_DB, FORMANT_WET, fs,
     )
 

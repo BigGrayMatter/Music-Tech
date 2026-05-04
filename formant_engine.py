@@ -64,7 +64,21 @@ VOWEL_F3: dict[str, float] = {
 # You can reorder this or make it genre-dependent later.
 VOWEL_TRAJECTORY = ["OO", "OH", "AH", "AE", "EE"]
 
-FUZZ_MODES = ("tanh", "asymmetric", "hardclip", "foldback", "diode")
+# Full 5-formant vocal tract data (F1–F5 Hz).
+# From Hillenbrand et al. (1995), American English male speaker averages.
+VOWEL_FORMANTS: dict[str, tuple] = {
+    #         F1    F2    F3    F4    F5
+    "OO": (  300,   870, 2240, 3180, 3800),
+    "OH": (  500,  1000, 2500, 3300, 4000),
+    "AH": (  800,  1200, 2500, 3300, 4000),
+    "AE": (  600,  1900, 2600, 3300, 4200),
+    "EE": (  300,  2300, 3000, 3600, 4300),
+}
+
+# Formant bandwidths (Hz) — real vocal tract values, not Q-derived.
+FORMANT_BW: tuple = (60.0, 90.0, 150.0, 200.0, 250.0)
+
+FUZZ_MODES = ("saturate", "tanh", "asymmetric", "hardclip", "foldback", "diode")
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +136,25 @@ class Biquad:
         a2    =  1 - alpha / A
         self.b = np.array([b0 / a0, b1 / a0, b2 / a0])
         self.a = np.array([a1 / a0, a2 / a0])
+
+    def set_resonator(self, f0: float, bw: float, fs: float):
+        """
+        All-pole 2nd-order resonator for vocal tract formant modeling.
+        H(z) = b0 / (1 + a1*z^-1 + a2*z^-2)
+        where b0 = 1 + a1 + a2 normalises DC gain to unity.
+        Formant peaks will be above 0 dB — the resonance boost is the effect.
+        Applied in CASCADE (series), not parallel, to create anti-formant
+        notches between peaks through section interaction.
+        """
+        f0 = np.clip(f0, 20.0, fs * 0.49)
+        bw = max(bw, 1.0)
+        r  = np.exp(-np.pi * bw / fs)
+        w0 = 2.0 * np.pi * f0 / fs
+        a1 = -2.0 * r * np.cos(w0)
+        a2 = r ** 2
+        b0 = 1.0 + a1 + a2   # = A(1), so H(1) = b0/A(1) = 1
+        self.b = np.array([b0, 0.0, 0.0])
+        self.a = np.array([a1, a2])
 
     def set_high_shelf(self, f0: float, gain_db: float, fs: float, slope: float = 1.0):
         """High-shelf EQ for feeding more upper harmonics into the formants."""
@@ -269,6 +302,15 @@ def interpolate_f3(y_pos: float,
     return f3_a + t * (f3_b - f3_a)
 
 
+def fuzz_saturate(x: np.ndarray, drive: float) -> np.ndarray:
+    """
+    Hard clip to ±1 after gain. No output normalization.
+    Approaches a square wave at drive >= 8 — maximum harmonic density.
+    This most closely replicates the saturated power amp in a real talk box.
+    """
+    return np.clip(x * drive, -1.0, 1.0)
+
+
 def fuzz_tanh(x: np.ndarray, drive: float) -> np.ndarray:
     return np.tanh(drive * x) / np.tanh(drive)
 
@@ -311,12 +353,32 @@ def fuzz_diode(x: np.ndarray, drive: float) -> np.ndarray:
 
 
 FUZZ_MODEL_FUNCS = {
-    "tanh": fuzz_tanh,
+    "saturate":   fuzz_saturate,
+    "tanh":       fuzz_tanh,
     "asymmetric": fuzz_asymmetric,
-    "hardclip": fuzz_hardclip,
-    "foldback": fuzz_foldback,
-    "diode": fuzz_diode,
+    "hardclip":   fuzz_hardclip,
+    "foldback":   fuzz_foldback,
+    "diode":      fuzz_diode,
 }
+
+
+def interpolate_formants(y_pos: float,
+                         trajectory: list[str] = VOWEL_TRAJECTORY,
+                         formants: dict = VOWEL_FORMANTS) -> tuple:
+    """
+    Map y_pos in [0, 1] to (F1, F2, F3, F4, F5) Hz by linearly
+    interpolating along the vowel trajectory.
+    """
+    y_pos = np.clip(y_pos, 0.0, 1.0)
+    n_segments = len(trajectory) - 1
+    scaled = y_pos * n_segments
+    idx    = int(scaled)
+    t      = scaled - idx
+    if idx >= n_segments:
+        return formants[trajectory[-1]]
+    fa = formants[trajectory[idx]]
+    fb = formants[trajectory[idx + 1]]
+    return tuple(a + t * (b - a) for a, b in zip(fa, fb))
 
 
 def blend_with_model(model_f1: float, model_f2: float,
@@ -350,27 +412,22 @@ class PedalParams:
     wah_Q:      float = 4.0
 
     # Pre-drive: fuzz applied BEFORE filters.
-    # 1.0 = clean, 4.0 = medium, 8.0+ = heavy.
-    # Higher drive creates richer harmonics — essential for audible formants.
-    pre_drive:  float = 4.0
-    fuzz_mode:  str = "diode"
-    # High-shelf boost above 1 kHz before the formant filters.
-    # Compensates for guitar's natural spectral roll-off so F2/F3 have
-    # energy to shape. 8 dB is a good starting point.
-    pre_emphasis_db: float = 8.0
+    # For talk box emulation, drive should be high (8–12) to approach a
+    # square wave — maximum harmonic density for the formant filter to shape.
+    pre_drive:  float = 10.0
+    fuzz_mode:  str = "saturate"
+    # High-shelf boost above 1 kHz, applied after fuzz before formant filters.
+    # Compensates for spectral roll-off so F3/F4/F5 have energy to shape.
+    pre_emphasis_db: float = 6.0
 
-    # Formant filter Q — controls bandwidth of each resonant peak.
-    # Lower Q = wider = more natural. Real speech F1 BW is ~100-200 Hz.
-    #   F1: Q=4  → BW=75 Hz at 300 Hz, 200 Hz at 800 Hz  (natural)
-    #   F2: Q=10 → BW=230 Hz at 2300 Hz, 90 Hz at 900 Hz (good at high F2)
-    #   F3: Q=8  → BW=390 Hz at 3100 Hz                   (broad, subtle)
-    f1_Q:       float = 4.0
-    f2_Q:       float = 10.0
-    f3_Q:       float = 8.0
-    f3_gain:    float = 0.45   # weight of F3 in the summed vocal tract
-    # Peak boost at each formant (dB). F2 gets -3dB, F3 gets -6dB relative.
-    # 18 dB gives a clear vowel colour without sounding like a synth filter.
-    formant_peak_db: float = 18.0
+    # Formant bandwidths (Hz) — independent of formant frequency.
+    # These match real vocal tract measurements, not Q-derived values.
+    # Narrower = more resonant peak, wider = more natural/breathy.
+    f1_bw: float = 60.0
+    f2_bw: float = 90.0
+    f3_bw: float = 150.0
+    f4_bw: float = 200.0
+    f5_bw: float = 250.0
     # Overall gain of the vocal tract signal before wet/dry blend.
     formant_gain: float = 1.0
 
@@ -412,13 +469,14 @@ class PedalEngine:
         # Filters
         self.pre_emphasis = Biquad()
         self.wah_bpf      = Biquad()
-        self.f1_bpf       = Biquad()
-        self.f2_bpf       = Biquad()
-        self.f3_bpf       = Biquad()
+        # Five all-pole resonators — applied in SERIES (cascade) in process_block
+        self.f1_bpf = Biquad()
+        self.f2_bpf = Biquad()
+        self.f3_bpf = Biquad()
+        self.f4_bpf = Biquad()
+        self.f5_bpf = Biquad()
 
         # Envelope followers — fast tracks attacks, slow tracks sustain.
-        # Transient delta (fast - slow) gives a clean per-attack F2 nudge
-        # that decays back to zero on sustained notes.
         self.env_follower = EnvelopeFollower(
             attack_ms=self.params.env_attack_ms,
             release_ms=self.params.env_release_ms,
@@ -430,18 +488,17 @@ class PedalEngine:
             fs=fs,
         )
 
-        # Frequency smoothers
+        # Frequency smoothers (one per formant + wah)
         wah_init = self._wah_target()
         self.wah_smoother = FreqSmoother(wah_init, self.params.wah_smooth_ms,
                                          fs, block_size)
-        f1_init, f2_init  = interpolate_vowel(self.params.y_pos)
-        f3_init = interpolate_f3(self.params.y_pos)
-        self.f1_smoother  = FreqSmoother(f1_init, self.params.formant_smooth_ms,
-                                         fs, block_size)
-        self.f2_smoother  = FreqSmoother(f2_init, self.params.formant_smooth_ms,
-                                         fs, block_size)
-        self.f3_smoother  = FreqSmoother(f3_init, self.params.formant_smooth_ms,
-                                         fs, block_size)
+        f1i, f2i, f3i, f4i, f5i = interpolate_formants(self.params.y_pos)
+        sm = self.params.formant_smooth_ms
+        self.f1_smoother = FreqSmoother(f1i, sm, fs, block_size)
+        self.f2_smoother = FreqSmoother(f2i, sm, fs, block_size)
+        self.f3_smoother = FreqSmoother(f3i, sm, fs, block_size)
+        self.f4_smoother = FreqSmoother(f4i, sm, fs, block_size)
+        self.f5_smoother = FreqSmoother(f5i, sm, fs, block_size)
 
         # Update coefficients with initial params
         self._update_coefficients(f2_env_offset=0.0)
@@ -454,46 +511,42 @@ class PedalEngine:
         p = self.params
         return p.wah_f_min + p.x_pos * (p.wah_f_max - p.wah_f_min)
 
-    def _formant_targets(self, f2_env_offset: float) -> tuple[float, float, float]:
+    def _formant_targets(self, f2_env_offset: float) -> tuple:
         p = self.params
-        manual_f1, manual_f2 = interpolate_vowel(p.y_pos)
-        manual_f3 = interpolate_f3(p.y_pos)
+        fmts = list(interpolate_formants(p.y_pos))
         if p.model_f1 is not None and p.model_f2 is not None:
-            f1, f2 = blend_with_model(p.model_f1, p.model_f2,
-                                      manual_f1, manual_f2, p.model_blend)
-        else:
-            f1, f2 = manual_f1, manual_f2
-        if p.model_f3 is not None:
-            f3 = (1 - p.model_blend) * p.model_f3 + p.model_blend * manual_f3
-        else:
-            f3 = manual_f3
-        f2 += f2_env_offset
-        return f1, f2, f3
+            fmts[0] = (1-p.model_blend)*p.model_f1 + p.model_blend*fmts[0]
+            fmts[1] = (1-p.model_blend)*p.model_f2 + p.model_blend*fmts[1]
+        fmts[1] += f2_env_offset   # envelope follower modulates F2
+        return tuple(fmts)
 
     def _update_coefficients(self, f2_env_offset: float):
         p  = self.params
         fs = self.fs
 
         wah_f = self.wah_smoother.update(self._wah_target())
-        f1_t, f2_t, f3_t = self._formant_targets(f2_env_offset)
-        f1_f  = self.f1_smoother.update(f1_t)
-        f2_f  = self.f2_smoother.update(f2_t)
-        f3_f  = self.f3_smoother.update(f3_t)
+        f1_t, f2_t, f3_t, f4_t, f5_t = self._formant_targets(f2_env_offset)
+        f1_f = self.f1_smoother.update(f1_t)
+        f2_f = self.f2_smoother.update(f2_t)
+        f3_f = self.f3_smoother.update(f3_t)
+        f4_f = self.f4_smoother.update(f4_t)
+        f5_f = self.f5_smoother.update(f5_t)
 
         self.pre_emphasis.set_high_shelf(1000.0, p.pre_emphasis_db, fs)
         self.wah_bpf.set_bandpass(wah_f, p.wah_Q, fs)
-        # Peaking EQ for formants: preserves full-bandwidth signal, adds
-        # resonant peaks at the vowel formant frequencies.  This is closer
-        # to how a real vocal tract works than pure bandpass filtering.
-        self.f1_bpf.set_peaking(f1_f, p.f1_Q, p.formant_peak_db,        fs)
-        self.f2_bpf.set_peaking(f2_f, p.f2_Q, p.formant_peak_db - 3.0,  fs)
-        self.f3_bpf.set_peaking(f3_f, p.f3_Q, p.formant_peak_db - 6.0,  fs)
+        # All-pole resonators: applied in CASCADE in process_block.
+        self.f1_bpf.set_resonator(f1_f, p.f1_bw, fs)
+        self.f2_bpf.set_resonator(f2_f, p.f2_bw, fs)
+        self.f3_bpf.set_resonator(f3_f, p.f3_bw, fs)
+        self.f4_bpf.set_resonator(f4_f, p.f4_bw, fs)
+        self.f5_bpf.set_resonator(f5_f, p.f5_bw, fs)
 
-        # Store current smoothed values for the GUI to read
         self._current_wah_f = wah_f
         self._current_f1    = f1_f
         self._current_f2    = f2_f
         self._current_f3    = f3_f
+        self._current_f4    = f4_f
+        self._current_f5    = f5_f
 
     # ------------------------------------------------------------------
     # Public API
@@ -550,15 +603,16 @@ class PedalEngine:
         wah_out = self.wah_bpf.process_block(formant_input)
         wah_mix = (1 - p.wah_wet) * formant_input + p.wah_wet * wah_out
 
-        # Vocal tract: three parallel peaking EQ filters (vowel resonances).
-        # Each filter boosts its band while passing everything else, so the
-        # output retains the full spectrum with vowel-coloured peaks on top.
-        f1_out = self.f1_bpf.process_block(wah_mix)
-        f2_out = self.f2_bpf.process_block(wah_mix)
-        f3_out = self.f3_bpf.process_block(wah_mix)
-        # F1 carries the most energy in natural vowels; F2 less; F3 subtle.
-        vocal_tract = f1_out * 0.55 + f2_out * 0.35 + f3_out * (p.f3_gain * 0.10)
-        vocal_tract *= p.formant_gain
+        # All-pole vocal tract: five resonators in CASCADE (series).
+        # Each resonator's output feeds the next — this is what creates
+        # anti-formant notches between peaks, giving vowel identity rather
+        # than wah character. Signal passes through all five sections.
+        vt = self.f1_bpf.process_block(wah_mix)
+        vt = self.f2_bpf.process_block(vt)
+        vt = self.f3_bpf.process_block(vt)
+        vt = self.f4_bpf.process_block(vt)
+        vt = self.f5_bpf.process_block(vt)
+        vocal_tract = vt * p.formant_gain
 
         # Blend: formant_wet=1.0 → full vowel filter, =0.0 → clean dry.
         # Blend against x_clean (pre-drive) so at wet=0 you hear unprocessed guitar.
@@ -574,21 +628,22 @@ class PedalEngine:
         Safe to call between process_block() calls.
         """
         return {
-            "wah_hz":  getattr(self, "_current_wah_f", 0.0),
-            "f1_hz":   getattr(self, "_current_f1",    0.0),
-            "f2_hz":   getattr(self, "_current_f2",    0.0),
-            "f3_hz":   getattr(self, "_current_f3",    0.0),
-            "x_pos":   self.params.x_pos,
-            "y_pos":   self.params.y_pos,
+            "wah_hz":   getattr(self, "_current_wah_f", 0.0),
+            "f1_hz":    getattr(self, "_current_f1",    0.0),
+            "f2_hz":    getattr(self, "_current_f2",    0.0),
+            "f3_hz":    getattr(self, "_current_f3",    0.0),
+            "f4_hz":    getattr(self, "_current_f4",    0.0),
+            "f5_hz":    getattr(self, "_current_f5",    0.0),
+            "x_pos":    self.params.x_pos,
+            "y_pos":    self.params.y_pos,
             "envelope": self.env_follower.envelope,
             "transient": max(0.0, self.env_follower.envelope - self.env_follower_slow.envelope),
         }
 
     def reset(self):
-        self.pre_emphasis.reset()
-        self.wah_bpf.reset()
-        self.f1_bpf.reset()
-        self.f2_bpf.reset()
-        self.f3_bpf.reset()
+        for bq in (self.pre_emphasis, self.wah_bpf,
+                   self.f1_bpf, self.f2_bpf, self.f3_bpf,
+                   self.f4_bpf, self.f5_bpf):
+            bq.reset()
         self.env_follower.reset()
         self.env_follower_slow.reset()
