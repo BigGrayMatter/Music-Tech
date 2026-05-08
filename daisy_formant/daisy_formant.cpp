@@ -195,6 +195,9 @@ void UpdateKnobs()
     // Formant resonators: interpolate vowel position from knob2
     float freqs[N_FORMANTS];
     InterpFormants(k2, freqs);
+    // F2 coupling to wah: sweeping wah brighter pulls F2 toward front vowels.
+    // alpha=0.15 keeps this subliminal — the axes still feel independent.
+    freqs[1] = fclamp(freqs[1] + 0.15f * (wahFreq - 1200.0f), 300.0f, 3500.0f);
     for(int i = 0; i < N_FORMANTS; i++) {
         DesignResonator(coefs, freqs[i], FORMANT_BW[i], fs);
         resonL[i].SetCoefs(coefs);
@@ -225,11 +228,10 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
         float inr = in[i + 1];
 
         // ── 1. Hard-clip saturation ──────────────────────────────────────
-        // Drives the signal toward a square wave for maximum harmonic density.
-        // The formant resonators need harmonics to shape — a clean guitar
-        // signal has too few for the effect to be audible.
-        float drvL = fclamp(inl * DRIVE, -1.0f, 1.0f);
-        float drvR = fclamp(inr * DRIVE, -1.0f, 1.0f);
+        // Wah position gates drive: higher wah (brighter) = more saturation.
+        float effectiveDrive = DRIVE * (1.0f + 0.3f * k1);
+        float drvL = fclamp(inl * effectiveDrive, -1.0f, 1.0f);
+        float drvR = fclamp(inr * effectiveDrive, -1.0f, 1.0f);
 
         // ── 2. High-shelf pre-emphasis ──────────────────────────────────
         // Tilts the spectrum so F3/F4/F5 (2–4 kHz) have enough energy.
