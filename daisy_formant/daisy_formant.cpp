@@ -46,6 +46,12 @@ static const float WAH_WET         = 0.8f;   // wah dry/wet blend
 static const float FORMANT_WET     = 0.95f;  // formant dry/wet blend
 static const int   N_FORMANTS      = 5;
 
+// Envelope follower / consonant onset
+static const float ONSET_THRESHOLD = 0.05f;  // transient level that triggers consonant snap
+static const float ONSET_DEPTH     = 0.6f;   // how far toward OO to snap [0, 1]
+static const float ONSET_DECAY_MS  = 30.0f;  // consonant onset release time (ms)
+static const float ENV_F2_DEPTH_HZ = 150.0f; // max F2 shift from pick attack (Hz)
+
 // Vowel formant table: 5 vowels × 5 formants (F1–F5) in Hz.
 // From Hillenbrand et al. (1995), American English male averages.
 //                      F1      F2      F3      F4      F5
@@ -91,6 +97,27 @@ struct Bq {
 };
 
 // ---------------------------------------------------------------------------
+// Envelope follower — peak detector with independent attack / release
+// ---------------------------------------------------------------------------
+
+struct EnvFollower {
+    float attackCoeff, releaseCoeff, value;
+
+    void Init(float attack_ms, float release_ms, float fs) {
+        attackCoeff  = expf(-1.0f / (fs * attack_ms  / 1000.0f));
+        releaseCoeff = expf(-1.0f / (fs * release_ms / 1000.0f));
+        value = 0.0f;
+    }
+
+    float Process(float x) {
+        float level = fabsf(x);
+        float coeff = (level > value) ? attackCoeff : releaseCoeff;
+        value = coeff * value + (1.0f - coeff) * level;
+        return value;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Filter bank (stereo pairs)
 // ---------------------------------------------------------------------------
 
@@ -98,6 +125,12 @@ static Bq wahL,      wahR;       // wah bandpass
 static Bq shelfL,    shelfR;     // high-shelf pre-emphasis (fixed)
 static Bq resonL[N_FORMANTS];   // formant cascade — left
 static Bq resonR[N_FORMANTS];   // formant cascade — right
+
+// Envelope follower state
+static EnvFollower envFast, envSlow;  // transient = fast − slow
+static float onsetEnv       = 0.0f;  // consonant onset depth [0,1], decays per-sample
+static float onsetDecay     = 0.0f;  // per-sample decay coeff, set in main()
+static float blockTransient = 0.0f;  // peak transient accumulated over current block
 
 // ---------------------------------------------------------------------------
 // Coefficient design functions
@@ -192,17 +225,26 @@ void UpdateKnobs()
     wahL.SetCoefs(coefs);
     wahR.SetCoefs(coefs);
 
-    // Formant resonators: interpolate vowel position from knob2
+    // Consonant onset snaps vowel position toward OO on pick attack.
+    // onsetEnv decays per-sample in AudioCallback; here we just read it.
+    float vowelPos = k2 * (1.0f - onsetEnv * ONSET_DEPTH);
+
+    // Formant resonators: interpolate onset-adjusted vowel position
     float freqs[N_FORMANTS];
-    InterpFormants(k2, freqs);
-    // F2 coupling to wah: sweeping wah brighter pulls F2 toward front vowels.
-    // alpha=0.15 keeps this subliminal — the axes still feel independent.
+    InterpFormants(vowelPos, freqs);
+
+    // F2 coupling to wah
     freqs[1] = fclamp(freqs[1] + 0.15f * (wahFreq - 1200.0f), 300.0f, 3500.0f);
+    // F2 modulation from pick attack transient
+    freqs[1] = fclamp(freqs[1] + blockTransient * ENV_F2_DEPTH_HZ, 300.0f, 3500.0f);
+
     for(int i = 0; i < N_FORMANTS; i++) {
         DesignResonator(coefs, freqs[i], FORMANT_BW[i], fs);
         resonL[i].SetCoefs(coefs);
         resonR[i].SetCoefs(coefs);
     }
+
+    blockTransient = 0.0f;  // reset accumulator for the next block
 }
 
 void Controls()
@@ -232,6 +274,20 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
         float effectiveDrive = DRIVE * (1.0f + 0.3f * k1);
         float drvL = fclamp(inl * effectiveDrive, -1.0f, 1.0f);
         float drvR = fclamp(inr * effectiveDrive, -1.0f, 1.0f);
+
+        // ── Envelope follower / consonant onset ─────────────────────────
+        // Mono abs value feeds two followers with different release times.
+        // Transient = fast − slow: non-zero only on pick attacks.
+        float envIn    = 0.5f * (fabsf(drvL) + fabsf(drvR));
+        float fast     = envFast.Process(envIn);
+        float slow     = envSlow.Process(envIn);
+        float transient = (fast > slow) ? (fast - slow) : 0.0f;
+        if(transient > blockTransient) blockTransient = transient;
+
+        // Trigger onset on sharp transient; don't re-trigger while decaying.
+        if(transient > ONSET_THRESHOLD && onsetEnv < 0.1f)
+            onsetEnv = 1.0f;
+        onsetEnv *= onsetDecay;
 
         // ── 2. High-shelf pre-emphasis ──────────────────────────────────
         // Tilts the spectrum so F3/F4/F5 (2–4 kHz) have enough energy.
@@ -277,6 +333,12 @@ int main(void)
 
     float fs = pod.AudioSampleRate();
     float coefs[5];
+
+    // Envelope followers: fast tracks attacks (5ms/80ms), slow tracks sustain (5ms/500ms).
+    // Transient delta = fast − slow is non-zero only on pick attacks.
+    envFast.Init(5.0f,  80.0f, fs);
+    envSlow.Init(5.0f, 500.0f, fs);
+    onsetDecay = expf(-1.0f / (fs * ONSET_DECAY_MS / 1000.0f));
 
     // High-shelf pre-emphasis: fixed +6 dB above 1 kHz.
     // Computed once here since it never changes.
